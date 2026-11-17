@@ -154,8 +154,9 @@ def ensure_tool(name, auto_install=True):
     return False
 
 
-def run(cmd, timeout=1800, stdin_data=None):
-    """بيشغل أمر ويرجع الـ stdout. لو فشل بيرجع نص فاضي."""
+def run(cmd, timeout=1800, stdin_data=None, cwd=None):
+    """بيشغل أمر ويرجع الـ stdout. لو فشل بيرجع نص فاضي، وبيطبع آخر سطور
+    الـ stderr عشان الفشل ميبقاش صامت زي ما حصل مع httpx."""
     try:
         res = subprocess.run(
             cmd,
@@ -164,13 +165,23 @@ def run(cmd, timeout=1800, stdin_data=None):
             text=True,
             timeout=timeout,
             errors="ignore",
+            cwd=cwd,
         )
+        if res.returncode != 0 and res.stderr.strip():
+            tail = res.stderr.strip().splitlines()[-3:]
+            log(f"  تحذير: {cmd[0]} رجع كود {res.returncode}: {' | '.join(tail)}")
         return res.stdout
     except subprocess.TimeoutExpired:
         log(f"timeout: {cmd[0]}")
     except Exception as e:
         log(f"error في {cmd[0]}: {e}")
     return ""
+
+
+def rl_int(rps):
+    """رقم صحيح آمن للـ flags اللي مش بتقبل كسور زي -rl في httpx/katana.
+    بيقرّب لتحت عشان نضمن إننا متعديناش الحد، بحد أدنى 1 (الأقل المدعوم)."""
+    return max(1, math.floor(rps))
 
 
 def extract_urls(text):
@@ -204,9 +215,10 @@ def tool_waymore(domain, a):
 
 
 def tool_katana(domain, a):
-    c = max(1, min(int(a.rps), a.threads))
+    rl = rl_int(a.rps)
+    c = max(1, min(rl, a.threads))
     cmd = ["katana", "-u", f"https://{domain}", "-d", str(a.depth),
-           "-jc", "-silent", "-rl", str(a.rps), "-c", str(c)]
+           "-jc", "-silent", "-rl", str(rl), "-c", str(c)]
     return extract_urls(run(cmd))
 
 
@@ -228,15 +240,19 @@ def tool_gospider(domain, a):
 
 
 def tool_paramspider(domain, a):
-    run(["paramspider", "-d", domain])
+    # paramspider مفيهاش flag رسمي لتحديد مكان الملف الناتج: بتكتب دايماً في
+    # results/<domain>.txt نسبي لمكان ما بتشتغل منه. فبنشغّلها جوه الفولدر
+    # المؤقت بتاع السكريبت (a.tmp) عشان متلخبطش مكان المستخدم الحالي.
+    run(["paramspider", "-d", domain], cwd=a.tmp)
     urls = set()
-    res_file = os.path.join("results", f"{domain}.txt")
+    res_dir = os.path.join(a.tmp, "results")
+    res_file = os.path.join(res_dir, f"{domain}.txt")
     if os.path.exists(res_file):
         with open(res_file, errors="ignore") as f:
             urls = extract_urls(f.read())
         os.remove(res_file)
         try:
-            os.rmdir("results")
+            os.rmdir(res_dir)
         except OSError:
             pass
     return urls
@@ -287,13 +303,17 @@ def stage_probe(raw_file, a):
         sys.exit("[!] httpx (بتاع ProjectDiscovery) مش موجود ومعرفتش أنزله. "
                  "نزله بإيدك: go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
     live_file = os.path.join(a.out, "live_urls.txt")
-    log(f"بفحص مين الـ URLs الشغالة (بحد {a.rps} طلب/ثانية)...")
-    t = max(1, min(int(a.rps), a.threads))
-    subprocess.run([
-        "httpx", "-l", raw_file, "-silent", "-rl", str(a.rps), "-t", str(t),
+    rl = rl_int(a.rps)
+    log(f"بفحص مين الـ URLs الشغالة (بحد {rl} طلب/ثانية)...")
+    t = max(1, min(rl, a.threads))
+    r = subprocess.run([
+        "httpx", "-l", raw_file, "-silent", "-rl", str(rl), "-t", str(t),
         "-mc", "200,201,204,301,302,303,307,308,401,403",
         "-o", live_file,
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ], capture_output=True, text=True, timeout=1800, errors="ignore")
+    if r.returncode != 0 and r.stderr.strip():
+        tail = r.stderr.strip().splitlines()[-5:]
+        log(f"  تحذير: httpx رجع كود {r.returncode}: {' | '.join(tail)}")
 
     if not os.path.exists(live_file):
         open(live_file, "w").close()
@@ -357,6 +377,10 @@ def main():
     if a.rps is None:
         a.rps = ask_rps()
     log(f"هلتزم بحد أقصى {a.rps} طلب/ثانية على كل أداة بتكلم التارجت")
+    if a.rps < 1:
+        log(f"  تنبيه: httpx و katana أقل حاجة بيقبلوها هي 1 طلب/ثانية، "
+            f"فهيشتغلوا بـ 1 (أسرع من الـ {a.rps} اللي حددتها)؛ "
+            f"gospider بس هيلتزم بالرقم بالظبط")
 
     domain = a.domain.lower().replace("https://", "").replace("http://", "").strip("/")
     a.out = os.path.abspath(a.out)
